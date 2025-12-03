@@ -1,0 +1,327 @@
+name: CI-CD AKS
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: CI
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.short.outputs.short_sha }}
+
+    env:
+      ACR_NAME: acr${{ vars.APELLIDO }}            # o acrglobalcicd si así lo usaste en Jenkins
+      IMAGE_BASE_NAME: my-nodejs-app
+      RESOURCE_GROUP: rg-cicd-terraform-app-${{ vars.APELLIDO }}
+      AKS_NAME: aks-dev-eastus                    # ajusta si tu cluster se llama distinto
+
+    steps:
+      # [CI] Obtener código fuente
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # [CI] Configurar Node.js
+      - name: Configurar Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+
+      # [CI] Instalar dependencias
+      - name: Instalar dependencias
+        run: npm install
+
+      # [CI] Ejecutar pruebas unitarias
+      - name: Ejecutar pruebas unitarias
+        run: npm run test:unit
+
+      # [CI] Ejecutar pruebas de integración
+      - name: Ejecutar pruebas de integración
+        run: npm run test:integration
+
+      # [CI] Azure Login
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # [CI] AKS Credentials
+      - name: Obtener credenciales de AKS
+        run: |
+          az aks get-credentials \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_NAME \
+            --overwrite-existing
+
+      # [CI] Generar ID corto del commit
+      - name: Obtener SHA corto
+        id: short
+        run: echo "short_sha=$(git rev-parse --short $GITHUB_SHA)" >> $GITHUB_OUTPUT
+
+      # [CI] Build and Push Docker Image
+      - name: Build & Push Docker Image a ACR
+        env:
+          ACR_NAME: ${{ env.ACR_NAME }}
+          IMAGE_BASE_NAME: ${{ env.IMAGE_BASE_NAME }}
+        run: |
+          IMAGE_TAG=${{ steps.short.outputs.short_sha }}
+          ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+          IMAGE_NAME="${IMAGE_BASE_NAME}-${{ vars.APELLIDO }}"
+
+          echo ">>> Login al ACR..."
+          az acr login --name $ACR_NAME
+
+          echo ">>> Build de imagen..."
+          docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG .
+
+          echo ">>> Push al ACR..."
+          docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG
+
+  deploy-dev:
+    name: CD [DEV]
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+
+    env:
+      ACR_NAME: acr${{ vars.APELLIDO }}
+      IMAGE_BASE_NAME: my-nodejs-app
+      RESOURCE_GROUP: rg-cicd-terraform-app-${{ vars.APELLIDO }}
+      AKS_NAME: aks-dev-eastus      # mismo cluster, distinto namespace/Service por ENV
+      ENV: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Obtener credenciales de AKS
+        run: |
+          az aks get-credentials \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_NAME \
+            --overwrite-existing
+
+      # [CD-DEV] Renderizar manifiesto k8s y hacer deploy
+      - name: Deploy a AKS (DEV)
+        run: |
+          sudo apt-get update && sudo apt-get install -y gettext-base
+
+          IMAGE_TAG=${{ needs.build.outputs.image_tag }}
+          ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+          IMAGE_NAME="${IMAGE_BASE_NAME}-${{ vars.APELLIDO }}"
+
+          export ACR_LOGIN_SERVER
+          export IMAGE_NAME
+          export IMAGE_TAG
+          export APELLIDO=${{ vars.APELLIDO }}
+          export ENV=${ENV}
+
+          echo ">>> Renderizando k8s.yml -> k8s-dev.yml..."
+          envsubst < k8s.yml > k8s-dev.yml
+          cat k8s-dev.yml
+
+          echo ">>> Aplicando manifiesto en AKS..."
+          kubectl apply -f k8s-dev.yml
+
+      # [CD-DEV] Imprimir IP del servicio
+      - name: Obtener IP del servicio (DEV)
+        run: |
+          SERVICE_NAME="my-nodejs-service-${{ vars.APELLIDO }}-${ENV}"
+          echo "Buscando IP del Service: $SERVICE_NAME"
+
+          LB_IP=""
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+
+          while [ -z "$LB_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            LB_IP=$(kubectl get svc "$SERVICE_NAME" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            if [ -z "$LB_IP" ]; then
+              RETRY_COUNT=$((RETRY_COUNT+1))
+              echo "Intento $RETRY_COUNT/$MAX_RETRIES: IP aún no asignada, esperando 10s..."
+              sleep 10
+            fi
+          done
+
+          if [ -z "$LB_IP" ]; then
+            echo ">>> No se pudo obtener la IP del LoadBalancer en DEV."
+            exit 1
+          else
+            echo ">>> IP del servicio DEV: $LB_IP"
+          fi
+
+  approval-qa:
+    name: Aprobación QA
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment:
+      name: approval-qa   # configura este environment con aprobación manual en GitHub
+    steps:
+      - name: Esperando aprobación QA
+        run: echo "Esperando aprobación para desplegar a QA..."
+
+  deploy-qa:
+    name: CD [QA]
+    needs: approval-qa
+    runs-on: ubuntu-latest
+    environment: qa
+
+    env:
+      ACR_NAME: acr${{ vars.APELLIDO }}
+      IMAGE_BASE_NAME: my-nodejs-app
+      RESOURCE_GROUP: rg-cicd-terraform-app-${{ vars.APELLIDO }}
+      AKS_NAME: aks-dev-eastus
+      ENV: qa
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Obtener credenciales de AKS
+        run: |
+          az aks get-credentials \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_NAME \
+            --overwrite-existing
+
+      - name: Deploy a AKS (QA)
+        run: |
+          sudo apt-get update && sudo apt-get install -y gettext-base
+
+          IMAGE_TAG=${{ needs.build.outputs.image_tag }}
+          ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+          IMAGE_NAME="${IMAGE_BASE_NAME}-${{ vars.APELLIDO }}"
+
+          export ACR_LOGIN_SERVER
+          export IMAGE_NAME
+          export IMAGE_TAG
+          export APELLIDO=${{ vars.APELLIDO }}
+          export ENV=${ENV}
+
+          echo ">>> Renderizando k8s.yml -> k8s-qa.yml..."
+          envsubst < k8s.yml > k8s-qa.yml
+          cat k8s-qa.yml
+
+          echo ">>> Aplicando manifiesto en AKS..."
+          kubectl apply -f k8s-qa.yml
+
+      - name: Obtener IP del servicio (QA)
+        run: |
+          SERVICE_NAME="my-nodejs-service-${{ vars.APELLIDO }}-${ENV}"
+          echo "Buscando IP del Service: $SERVICE_NAME"
+
+          LB_IP=""
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+
+          while [ -z "$LB_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            LB_IP=$(kubectl get svc "$SERVICE_NAME" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            if [ -z "$LB_IP" ]; then
+              RETRY_COUNT=$((RETRY_COUNT+1))
+              echo "Intento $RETRY_COUNT/$MAX_RETRIES: IP aún no asignada, esperando 10s..."
+              sleep 10
+            fi
+          done
+
+          if [ -z "$LB_IP" ]; then
+            echo ">>> No se pudo obtener la IP del LoadBalancer en QA."
+            exit 1
+          else
+            echo ">>> IP del servicio QA: $LB_IP"
+          fi
+
+  approval-prd:
+    name: Aprobación PRD
+    needs: deploy-qa
+    runs-on: ubuntu-latest
+    environment:
+      name: approval-prd
+    steps:
+      - name: Esperando aprobación PRD
+        run: echo "Esperando aprobación para desplegar a PRD..."
+
+  deploy-prd:
+    name: CD [PRD]
+    needs: approval-prd
+    runs-on: ubuntu-latest
+    environment: prd
+
+    env:
+      ACR_NAME: acr${{ vars.APELLIDO }}
+      IMAGE_BASE_NAME: my-nodejs-app
+      RESOURCE_GROUP: rg-cicd-terraform-app-${{ vars.APELLIDO }}
+      AKS_NAME: aks-dev-eastus
+      ENV: prd
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Obtener credenciales de AKS
+        run: |
+          az aks get-credentials \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_NAME \
+            --overwrite-existing
+
+      - name: Deploy a AKS (PRD)
+        run: |
+          sudo apt-get update && sudo apt-get install -y gettext-base
+
+          IMAGE_TAG=${{ needs.build.outputs.image_tag }}
+          ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+          IMAGE_NAME="${IMAGE_BASE_NAME}-${{ vars.APELLIDO }}"
+
+          export ACR_LOGIN_SERVER
+          export IMAGE_NAME
+          export IMAGE_TAG
+          export APELLIDO=${{ vars.APELLIDO }}
+          export ENV=${ENV}
+
+          echo ">>> Renderizando k8s.yml -> k8s-prd.yml..."
+          envsubst < k8s.yml > k8s-prd.yml
+          cat k8s-prd.yml
+
+          echo ">>> Aplicando manifiesto en AKS..."
+          kubectl apply -f k8s-prd.yml
+
+      - name: Obtener IP del servicio (PRD)
+        run: |
+          SERVICE_NAME="my-nodejs-service-${{ vars.APELLIDO }}-${ENV}"
+          echo "Buscando IP del Service: $SERVICE_NAME"
+
+          LB_IP=""
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+
+          while [ -z "$LB_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            LB_IP=$(kubectl get svc "$SERVICE_NAME" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            if [ -z "$LB_IP" ]; then
+              RETRY_COUNT=$((RETRY_COUNT+1))
+              echo "Intento $RETRY_COUNT/$MAX_RETRIES: IP aún no asignada, esperando 10s..."
+              sleep 10
+            fi
+          done
+
+          if [ -z "$LB_IP" ]; then
+            echo ">>> No se pudo obtener la IP del LoadBalancer en PRD."
+            exit 1
+          else
+            echo ">>> IP del servicio PRD: $LB_IP"
+          fi
